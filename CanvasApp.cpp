@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,12 @@ namespace canvas
             Panning
         };
 
+        enum class SelectionMode
+        {
+            Rectangle,
+            Lasso
+        };
+
         enum class AnchorMode
         {
             Center,
@@ -110,9 +117,14 @@ namespace canvas
         PointerMode pointerMode_{PointerMode::Idle};
         bool hasSelection_{false};
         bool movingSelection_{false};
+        SelectionMode selectionMode_{SelectionMode::Rectangle};
+        bool lassoClosed_{false};
+        std::vector<Vector2> lassoPoints_{};
+        SelectionMask lassoMask_{};
         Vector2 dragStartMouse_{};
         Vector2 dragStartPan_{};
         Vector2 selectionMoveStartGrid_{};
+        Vector2 selectionMoveOffset_{};
         Vector2 selectionStart_{};
         Vector2 selectionEnd_{};
         SelectionRect selection_{};
@@ -163,6 +175,7 @@ namespace canvas
             static constexpr Rectangle SettingsToggle(){ return Rectangle{kX, 758, kW, kBtnH}; }
             static constexpr Rectangle BrushThickness(){ return Rectangle{kX, 792, kW, kBtnH}; }
             static constexpr Rectangle AnchorMode(){ return Rectangle{kX, 826, kW, kBtnH}; }
+            static constexpr Rectangle SelectMode(){ return Rectangle{kX, 860, kW, kBtnH}; }
             static constexpr Rectangle OpsHeader(){ return Rectangle{kX, 888, kW, 28}; }
             static constexpr Rectangle FitZoom(){ return Rectangle{kX, 922, kW, kBtnH}; }
             static constexpr Rectangle WidthValue(){ return Rectangle{kX, 958, 120, 30}; }
@@ -480,6 +493,262 @@ namespace canvas
             return selection;
         }
 
+        SelectionRect MakeSelectionFromLasso() const
+        {
+            return lassoMask_.bounds;
+        }
+
+        Vector2 GridCellCenterToScreen(Vector2 gridCell) const
+        {
+            const float cellSize = static_cast<float>(document_.settings.cellSize);
+            const CanvasView view = GetCanvasView();
+            return Vector2{view.bounds.x + (gridCell.x + 0.5f) * cellSize * view.scale,
+                           view.bounds.y + (gridCell.y + 0.5f) * cellSize * view.scale};
+        }
+
+        bool PointInPolygon(Vector2 point, const std::vector<Vector2> &poly) const
+        {
+            if (poly.size() < 3)
+            {
+                return false;
+            }
+            bool inside = false;
+            for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+            {
+                const float yi = poly[i].y;
+                const float yj = poly[j].y;
+                const float denom = yj - yi;
+                const float xAtY = (std::fabs(denom) < 0.00001f)
+                                      ? poly[i].x
+                                      : (poly[j].x - poly[i].x) * (point.y - yi) / denom + poly[i].x;
+                const bool intersect = ((yi > point.y) != (yj > point.y)) && (point.x < xAtY);
+                if (intersect)
+                {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+
+        bool IsCellInsideLasso(int gx, int gy) const
+        {
+            if (!lassoClosed_ || lassoPoints_.size() < 3)
+            {
+                return false;
+            }
+            const Vector2 center = GridCellCenterToScreen(Vector2{static_cast<float>(gx), static_cast<float>(gy)});
+            return PointInPolygon(center, lassoPoints_);
+        }
+
+        bool IsSelectedCell(int gx, int gy) const
+        {
+            if (HasLassoSelection())
+            {
+                return lassoMask_.Contains(gx, gy);
+            }
+            return selection_.IsValid() && gx >= selection_.x && gy >= selection_.y && gx < selection_.x + selection_.width && gy < selection_.y + selection_.height;
+        }
+
+        bool HasLassoSelection() const
+        {
+            return selectionMode_ == SelectionMode::Lasso && lassoMask_.IsValid();
+        }
+
+        template <typename Fn>
+        void ApplySelectedCells(Fn &&fn)
+        {
+            if (HasLassoSelection())
+            {
+                for (int y = lassoMask_.bounds.y; y < lassoMask_.bounds.y + lassoMask_.bounds.height; ++y)
+                {
+                    for (int x = lassoMask_.bounds.x; x < lassoMask_.bounds.x + lassoMask_.bounds.width; ++x)
+                    {
+                        if (lassoMask_.Contains(x, y))
+                        {
+                            fn(x, y);
+                        }
+                    }
+                }
+                return;
+            }
+            if (!selection_.IsValid())
+            {
+                return;
+            }
+            for (int y = selection_.y; y < selection_.y + selection_.height; ++y)
+            {
+                for (int x = selection_.x; x < selection_.x + selection_.width; ++x)
+                {
+                    fn(x, y);
+                }
+            }
+        }
+
+        template <typename Fn>
+        void ForEachSelectedPixel(Fn &&fn) const
+        {
+            for (const auto &pixel : document_.pixels)
+            {
+                if (IsSelectedCell(pixel.x, pixel.y))
+                {
+                    fn(pixel);
+                }
+            }
+        }
+
+        void ClearSelectionState()
+        {
+            selection_ = {};
+            lassoMask_.Clear();
+            lassoPoints_.clear();
+            lassoClosed_ = false;
+            hasSelection_ = false;
+            movingSelection_ = false;
+        }
+
+        void ClearLassoPreview()
+        {
+            lassoPoints_.clear();
+            lassoClosed_ = false;
+        }
+
+        void UpdateLassoSelectionPreview(int dx, int dy)
+        {
+            if (!HasLassoSelection())
+            {
+                return;
+            }
+            selection_.x = std::clamp(static_cast<int>(lassoMask_.bounds.x) + dx, 0, document_.settings.width - lassoMask_.bounds.width);
+            selection_.y = std::clamp(static_cast<int>(lassoMask_.bounds.y) + dy, 0, document_.settings.height - lassoMask_.bounds.height);
+            selectionMoveOffset_ = Vector2{static_cast<float>(selection_.x - static_cast<int>(lassoMask_.bounds.x)),
+                                           static_cast<float>(selection_.y - static_cast<int>(lassoMask_.bounds.y))};
+        }
+
+        void UpdateSelectionFromCurrentMode()
+        {
+            if (HasLassoSelection())
+            {
+                selection_ = lassoMask_.bounds;
+                hasSelection_ = true;
+            }
+            else
+            {
+                hasSelection_ = selection_.IsValid();
+            }
+        }
+
+        size_t EraseSelectionUnified()
+        {
+            if (!selection_.IsValid())
+            {
+                return 0;
+            }
+            const size_t before = document_.pixels.size();
+            std::vector<PixelPaint> kept;
+            kept.reserve(document_.pixels.size());
+            for (const auto &pixel : document_.pixels)
+            {
+                if (!IsSelectedCell(pixel.x, pixel.y))
+                {
+                    kept.push_back(pixel);
+                }
+            }
+            document_.pixels = std::move(kept);
+            return before - document_.pixels.size();
+        }
+
+        size_t KeepSelectionOnlyUnified()
+        {
+            if (!selection_.IsValid())
+            {
+                return 0;
+            }
+            const size_t before = document_.pixels.size();
+            std::vector<PixelPaint> kept;
+            kept.reserve(document_.pixels.size());
+            for (const auto &pixel : document_.pixels)
+            {
+                if (IsSelectedCell(pixel.x, pixel.y))
+                {
+                    kept.push_back(pixel);
+                }
+            }
+            document_.pixels = std::move(kept);
+            return before - document_.pixels.size();
+        }
+
+        void FlipSelectionUnified(bool horizontal)
+        {
+            if (!selection_.IsValid())
+            {
+                return;
+            }
+            if (HasLassoSelection())
+            {
+                std::vector<PixelPaint> remapped = document_.pixels;
+                for (auto &pixel : remapped)
+                {
+                    if (!lassoMask_.Contains(pixel.x, pixel.y))
+                    {
+                        continue;
+                    }
+                    if (horizontal)
+                    {
+                        const int localX = pixel.x - lassoMask_.bounds.x;
+                        pixel.x = lassoMask_.bounds.x + lassoMask_.bounds.width - 1 - localX;
+                    }
+                    else
+                    {
+                        const int localY = pixel.y - lassoMask_.bounds.y;
+                        pixel.y = lassoMask_.bounds.y + lassoMask_.bounds.height - 1 - localY;
+                    }
+                }
+                document_.pixels = std::move(remapped);
+                lassoMask_.bounds = selection_;
+                return;
+            }
+            if (horizontal)
+            {
+                document_.FlipHorizontalInSelection(selection_);
+            }
+            else
+            {
+                document_.FlipVerticalInSelection(selection_);
+            }
+        }
+
+        void ShiftSelectionUnified(int dx, int dy)
+        {
+            if (!selection_.IsValid() || (dx == 0 && dy == 0))
+            {
+                return;
+            }
+            if (HasLassoSelection())
+            {
+                std::vector<PixelPaint> moved;
+                moved.reserve(document_.pixels.size());
+                for (const auto &pixel : document_.pixels)
+                {
+                    if (lassoMask_.Contains(pixel.x, pixel.y))
+                    {
+                        moved.push_back(PixelPaint{pixel.x + dx, pixel.y + dy, pixel.color});
+                    }
+                    else
+                    {
+                        moved.push_back(pixel);
+                    }
+                }
+                document_.pixels = std::move(moved);
+                lassoMask_.bounds.x += dx;
+                lassoMask_.bounds.y += dy;
+                selection_ = lassoMask_.bounds;
+                return;
+            }
+            document_.ShiftSelection(selection_, dx, dy);
+            selection_.x += dx;
+            selection_.y += dy;
+        }
+
         Rectangle SelectionToScreenRect(const SelectionRect &selection) const
         {
             const CanvasView view = GetCanvasView();
@@ -519,6 +788,112 @@ namespace canvas
                 PaintPixelLine(a, b);
             }
             MarkCanvasDirty();
+        }
+
+        void AddLassoPoint(Vector2 mouse)
+        {
+            if (!InCanvas(mouse))
+            {
+                return;
+            }
+            if (lassoPoints_.empty() || Distance(lassoPoints_.back(), mouse) >= 6.0f)
+            {
+                lassoPoints_.push_back(mouse);
+            }
+            MarkCanvasDirty();
+        }
+
+        void BeginLassoSelection(Vector2 mouse)
+        {
+            selection_ = {};
+            hasSelection_ = false;
+            lassoPoints_.clear();
+            lassoMask_.Clear();
+            lassoClosed_ = false;
+            selectionMode_ = SelectionMode::Lasso;
+            selectionStart_ = mouse;
+            selectionEnd_ = mouse;
+            AddLassoPoint(mouse);
+        }
+
+        void CloseLassoSelection()
+        {
+            if (lassoPoints_.size() < 3)
+            {
+                lassoClosed_ = false;
+                lassoMask_.Clear();
+                selection_ = {};
+                hasSelection_ = false;
+                SetStatus("Lasso cancelled");
+                return;
+            }
+
+            lassoClosed_ = Distance(lassoPoints_.front(), lassoPoints_.back()) <= 24.0f;
+            if (!lassoClosed_)
+            {
+                lassoMask_.Clear();
+                selection_ = {};
+                hasSelection_ = false;
+                SetStatus("Lasso cancelled");
+                return;
+            }
+
+            int minX = document_.settings.width;
+            int minY = document_.settings.height;
+            int maxX = -1;
+            int maxY = -1;
+            for (int y = 0; y < document_.settings.height; ++y)
+            {
+                for (int x = 0; x < document_.settings.width; ++x)
+                {
+                    if (IsCellInsideLasso(x, y))
+                    {
+                        minX = std::min(minX, x);
+                        minY = std::min(minY, y);
+                        maxX = std::max(maxX, x);
+                        maxY = std::max(maxY, y);
+                    }
+                }
+            }
+
+            if (maxX < minX || maxY < minY)
+            {
+                lassoMask_.Clear();
+                selection_ = {};
+                hasSelection_ = false;
+                SetStatus("No pixels inside lasso");
+                return;
+            }
+
+            SelectionRect bounds{minX, minY, maxX - minX + 1, maxY - minY + 1};
+            bounds.Normalize();
+            SelectionMask mask;
+            mask.bounds = bounds;
+            mask.cells.assign(static_cast<size_t>(bounds.width * bounds.height), 0);
+            int filled = 0;
+            for (int y = bounds.y; y < bounds.y + bounds.height; ++y)
+            {
+                for (int x = bounds.x; x < bounds.x + bounds.width; ++x)
+                {
+                    const bool inside = IsCellInsideLasso(x, y);
+                    mask.cells[static_cast<size_t>((y - bounds.y) * bounds.width + (x - bounds.x))] = inside ? 1 : 0;
+                    filled += inside ? 1 : 0;
+                }
+            }
+
+            if (!mask.IsValid() || filled <= 0)
+            {
+                lassoMask_.Clear();
+                selection_ = {};
+                hasSelection_ = false;
+                SetStatus("No pixels inside lasso");
+                return;
+            }
+
+            lassoMask_ = std::move(mask);
+            selection_ = lassoMask_.bounds;
+            hasSelection_ = true;
+            SetStatus(TextFormat("Lasso selection set (%d cells)", filled));
         }
 
         void DrawPixelCircle(Vector2 center, float radius, Color color) const
@@ -997,6 +1372,10 @@ namespace canvas
                 if (hit(toolRects[i]))
                 {
                     tool_ = static_cast<ToolType>(i);
+                    if (tool_ == ToolType::Select)
+                    {
+                        selectionMode_ = SelectionMode::Rectangle;
+                    }
                     SetStatus("Tool changed");
                     return;
                 }
@@ -1022,6 +1401,24 @@ namespace canvas
             if (hit(SidebarLayout::BrushThickness()))
             {
                 CycleAnchorMode();
+                return;
+            }
+            if (hit(SidebarLayout::SelectMode()))
+            {
+                if (tool_ == ToolType::Select)
+                {
+                    selectionMode_ = (selectionMode_ == SelectionMode::Rectangle) ? SelectionMode::Lasso : SelectionMode::Rectangle;
+                    if (selectionMode_ == SelectionMode::Rectangle)
+                    {
+                        lassoMask_.Clear();
+                        lassoClosed_ = false;
+                    }
+                    SetStatus(TextFormat("Select mode: %s", selectionMode_ == SelectionMode::Lasso ? "Lasso" : "Rect"));
+                }
+                else
+                {
+                    SetStatus("Switch to Select tool first");
+                }
                 return;
             }
 
@@ -1104,10 +1501,26 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    document_.CropToSelection(selection_);
-                    selection_ = {};
-                    hasSelection_ = false;
-                    movingSelection_ = false;
+                    if (HasLassoSelection())
+                    {
+                        CanvasDocument cropped;
+                        cropped.settings.width = lassoMask_.bounds.width;
+                        cropped.settings.height = lassoMask_.bounds.height;
+                        cropped.settings.cellSize = document_.settings.cellSize;
+                        for (const auto &pixel : document_.pixels)
+                        {
+                            if (lassoMask_.Contains(pixel.x, pixel.y))
+                            {
+                                cropped.pixels.push_back(PixelPaint{pixel.x - lassoMask_.bounds.x, pixel.y - lassoMask_.bounds.y, pixel.color});
+                            }
+                        }
+                        document_ = std::move(cropped);
+                    }
+                    else
+                    {
+                        document_.CropToSelection(selection_);
+                    }
+                    ClearSelectionState();
                     EnsureCanvasTexture();
                     MarkCanvasDirty();
                     SetStatus("Cropped to selection");
@@ -1122,7 +1535,7 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    const size_t removed = document_.EraseSelection(selection_);
+                    const size_t removed = EraseSelectionUnified();
                     MarkCanvasDirty();
                     SetStatus(TextFormat("Erased %zu pixels", removed));
                 }
@@ -1136,7 +1549,7 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    const size_t removed = document_.KeepSelectionOnly(selection_);
+                    const size_t removed = KeepSelectionOnlyUnified();
                     MarkCanvasDirty();
                     SetStatus(TextFormat("Removed %zu pixels outside selection", removed));
                 }
@@ -1150,7 +1563,7 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    document_.FlipHorizontalInSelection(selection_);
+                    FlipSelectionUnified(true);
                     MarkCanvasDirty();
                     SetStatus("Flipped selection horizontally");
                 }
@@ -1166,7 +1579,7 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    document_.FlipVerticalInSelection(selection_);
+                    FlipSelectionUnified(false);
                     MarkCanvasDirty();
                     SetStatus("Flipped selection vertically");
                 }
@@ -1180,9 +1593,7 @@ namespace canvas
             }
             if (hit(SidebarLayout::ClearSel()))
             {
-                selection_ = {};
-                hasSelection_ = false;
-                movingSelection_ = false;
+                ClearSelectionState();
                 SetStatus("Selection cleared");
                 return;
             }
@@ -1190,8 +1601,7 @@ namespace canvas
             {
                 if (selection_.IsValid())
                 {
-                    document_.ShiftSelection(selection_, 1, 0);
-                    selection_.x += 1;
+                    ShiftSelectionUnified(1, 0);
                     MarkCanvasDirty();
                     SetStatus("Shifted selection right by 1");
                 }
@@ -1268,7 +1678,25 @@ namespace canvas
                                                  gx < selection_.x + selection_.width &&
                                                  gy < selection_.y + selection_.height;
 
-                    if (tool_ == ToolType::Select && insideSelection)
+                    if (tool_ == ToolType::Select && selectionMode_ == SelectionMode::Lasso)
+                    {
+                        if (HasLassoSelection() && lassoMask_.Contains(gx, gy))
+                        {
+                            pointerMode_ = PointerMode::Panning;
+                            movingSelection_ = true;
+                            selectionMoveStartGrid_ = Vector2{static_cast<float>(selection_.x), static_cast<float>(selection_.y)};
+                            selectionMoveOffset_ = Vector2{0.0f, 0.0f};
+                            SetStatus("Move lasso selection");
+                        }
+                        else
+                        {
+                            ClearSelectionState();
+                            pointerMode_ = PointerMode::Selecting;
+                            BeginLassoSelection(mouse);
+                            SetStatus("Lasso selection started");
+                        }
+                    }
+                    else if (tool_ == ToolType::Select && insideSelection)
                     {
                         pointerMode_ = PointerMode::Panning;
                         movingSelection_ = true;
@@ -1276,10 +1704,12 @@ namespace canvas
                     }
                     else if (tool_ == ToolType::Select)
                     {
+                        ClearSelectionState();
                         pointerMode_ = PointerMode::Selecting;
                         selectionStart_ = mouse;
                         selectionEnd_ = mouse;
                         movingSelection_ = false;
+                        SetStatus("Rectangle selection started");
                     }
                     else
                     {
@@ -1313,13 +1743,12 @@ namespace canvas
                     const int dy = static_cast<int>(std::lround((mouse.y - dragStartMouse_.y) / cellStep));
                     const int newX = std::clamp(static_cast<int>(selectionMoveStartGrid_.x) + dx, 0, document_.settings.width - selection_.width);
                     const int newY = std::clamp(static_cast<int>(selectionMoveStartGrid_.y) + dy, 0, document_.settings.height - selection_.height);
-                    const int applyDx = newX - selection_.x;
-                    const int applyDy = newY - selection_.y;
-                    if (applyDx != 0 || applyDy != 0)
+                    if (newX != selection_.x || newY != selection_.y)
                     {
-                        document_.ShiftSelection(selection_, applyDx, applyDy);
                         selection_.x = newX;
                         selection_.y = newY;
+                        selectionMoveOffset_ = Vector2{static_cast<float>(selection_.x - static_cast<int>(selectionMoveStartGrid_.x)),
+                                                       static_cast<float>(selection_.y - static_cast<int>(selectionMoveStartGrid_.y))};
                         MarkCanvasDirty();
                     }
                 }
@@ -1330,13 +1759,25 @@ namespace canvas
                     MarkCanvasDirty();
                 }
             }
+            if (pointerMode_ == PointerMode::Selecting && tool_ == ToolType::Select && selectionMode_ == SelectionMode::Lasso && IsMouseButtonDown(MOUSE_LEFT_BUTTON) && !movingSelection_)
+            {
+                AddLassoPoint(mouse);
+            }
             if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON))
             {
                 if (pointerMode_ == PointerMode::Selecting)
                 {
-                    selection_ = MakeSelectionFromPoints(selectionStart_, selectionEnd_);
-                    hasSelection_ = selection_.IsValid();
-                    SetStatus(hasSelection_ ? "Selection set" : "Selection cleared");
+                    if (tool_ == ToolType::Select && selectionMode_ == SelectionMode::Lasso)
+                    {
+                        AddLassoPoint(mouse);
+                        CloseLassoSelection();
+                    }
+                    else
+                    {
+                        selection_ = MakeSelectionFromPoints(selectionStart_, selectionEnd_);
+                        UpdateSelectionFromCurrentMode();
+                        SetStatus(hasSelection_ ? "Selection set" : "Selection cleared");
+                    }
                 }
                 else if (pointerMode_ == PointerMode::Drawing && tool_ != ToolType::Pixel)
                 {
@@ -1345,10 +1786,19 @@ namespace canvas
                 }
                 else if (pointerMode_ == PointerMode::Panning && movingSelection_ && selection_.IsValid())
                 {
+                    const int dx = selection_.x - static_cast<int>(selectionMoveStartGrid_.x);
+                    const int dy = selection_.y - static_cast<int>(selectionMoveStartGrid_.y);
+                    ShiftSelectionUnified(dx, dy);
+                    if (HasLassoSelection())
+                    {
+                        lassoMask_.bounds = selection_;
+                    }
                     SetStatus(TextFormat("Moved selection to %d,%d", selection_.x, selection_.y));
+                    MarkCanvasDirty();
                 }
                 pointerMode_ = PointerMode::Idle;
                 movingSelection_ = false;
+                selectionMoveOffset_ = Vector2{0.0f, 0.0f};
                 EndUndoAction();
             }
             if (IsKeyPressed(KEY_C))
@@ -1377,17 +1827,15 @@ namespace canvas
                 BeginUndoIfNeeded();
                 if (selection_.IsValid())
                 {
-                    const size_t removed = document_.EraseSelection(selection_);
-                    selection_ = {};
-                    hasSelection_ = false;
+                    const size_t removed = EraseSelectionUnified();
+                    ClearSelectionState();
                     MarkCanvasDirty();
                     SetStatus(TextFormat("Deleted %zu pixels in selection", removed));
                     EndUndoAction();
                 }
                 else
                 {
-                    selection_ = {};
-                    hasSelection_ = false;
+                    ClearSelectionState();
                     SetStatus("Selection cleared");
                     EndUndoAction();
                 }
@@ -1397,7 +1845,7 @@ namespace canvas
                 BeginUndoIfNeeded();
                 if (selection_.IsValid())
                 {
-                    document_.FlipHorizontalInSelection(selection_);
+                    FlipSelectionUnified(true);
                     MarkCanvasDirty();
                     SetStatus("Flipped selection horizontally");
                 }
@@ -1414,7 +1862,7 @@ namespace canvas
                 BeginUndoIfNeeded();
                 if (selection_.IsValid())
                 {
-                    document_.FlipVerticalInSelection(selection_);
+                    FlipSelectionUnified(false);
                     MarkCanvasDirty();
                     SetStatus("Flipped selection vertically");
                 }
@@ -1582,17 +2030,74 @@ namespace canvas
                 }
             }
 
-            if (hasSelection_)
+            const auto withAlpha = [](Color c, unsigned char a) {
+                c.a = a;
+                return c;
+            };
+
+            if (movingSelection_ && selection_.IsValid())
+            {
+                const float offsetX = static_cast<float>(selection_.x - static_cast<int>(selectionMoveStartGrid_.x));
+                const float offsetY = static_cast<float>(selection_.y - static_cast<int>(selectionMoveStartGrid_.y));
+                const int dxPx = static_cast<int>(offsetX * document_.settings.cellSize * canvasZoom_);
+                const int dyPx = static_cast<int>(offsetY * document_.settings.cellSize * canvasZoom_);
+                const Color residueTint{255, 255, 255, 28};
+                const Color previewOutline{120, 190, 255, 220};
+                const Color previewFill{255, 255, 255, 88};
+
+                for (const auto &pixel : document_.pixels)
+                {
+                    if (!IsSelectedCell(pixel.x, pixel.y))
+                    {
+                        continue;
+                    }
+
+                    const int srcX = bounds.x + static_cast<int>(pixel.x * document_.settings.cellSize * canvasZoom_);
+                    const int srcY = bounds.y + static_cast<int>(pixel.y * document_.settings.cellSize * canvasZoom_);
+                    const int dstX = srcX + dxPx;
+                    const int dstY = srcY + dyPx;
+                    const Rectangle srcRect{static_cast<float>(srcX), static_cast<float>(srcY), static_cast<float>(document_.settings.cellSize * canvasZoom_),
+                                            static_cast<float>(document_.settings.cellSize * canvasZoom_)};
+                    const Rectangle dstRect{static_cast<float>(dstX), static_cast<float>(dstY), static_cast<float>(document_.settings.cellSize * canvasZoom_),
+                                            static_cast<float>(document_.settings.cellSize * canvasZoom_)};
+                    DrawRectangleRec(srcRect, withAlpha(residueTint, 24));
+                    DrawRectangleLinesEx(srcRect, 1.0f, withAlpha(residueTint, 40));
+                    DrawRectangleRec(dstRect, withAlpha(ToColor(pixel.color), 170));
+                    DrawRectangleLinesEx(dstRect, 1.0f, previewOutline);
+                    DrawRectangleLinesEx(Rectangle{dstRect.x + 1, dstRect.y + 1, dstRect.width - 2, dstRect.height - 2}, 1.0f, previewFill);
+                }
+            }
+            else if (hasSelection_ && !HasLassoSelection())
             {
                 const Rectangle sel = SelectionToScreenRect(selection_);
                 DrawRectangleRec(sel, Color{80, 140, 220, 40});
                 DrawRectangleLinesEx(sel, 2.0f, Color{120, 190, 255, 220});
             }
 
-            if (pointerMode_ == PointerMode::Selecting && tool_ == ToolType::Select)
+            if (pointerMode_ == PointerMode::Selecting && tool_ == ToolType::Select && selectionMode_ == SelectionMode::Rectangle)
             {
                 const Rectangle sel = SelectionToScreenRect(MakeSelectionFromPoints(selectionStart_, selectionEnd_));
                 DrawRectangleLinesEx(sel, 2.0f, Color{255, 240, 160, 255});
+            }
+            else if (tool_ == ToolType::Select && selectionMode_ == SelectionMode::Lasso)
+            {
+                for (size_t i = 1; i < lassoPoints_.size(); ++i)
+                {
+                    DrawLineEx(lassoPoints_[i - 1], lassoPoints_[i], 2.0f, Color{255, 240, 160, 255});
+                }
+                if (pointerMode_ == PointerMode::Selecting && lassoPoints_.size() >= 2)
+                {
+                    DrawLineEx(lassoPoints_.back(), GetMousePosition(), 2.0f, Color{255, 240, 160, 160});
+                }
+                if (lassoClosed_ && lassoPoints_.size() >= 2)
+                {
+                    DrawLineEx(lassoPoints_.back(), lassoPoints_.front(), 2.0f, Color{120, 190, 255, 255});
+                }
+                if (lassoMask_.IsValid())
+                {
+                    const Rectangle debugRect = SelectionToScreenRect(lassoMask_.bounds);
+                    DrawRectangleLinesEx(debugRect, 1.0f, Color{120, 255, 180, 180});
+                }
             }
 
             if (pointerMode_ == PointerMode::Drawing && tool_ != ToolType::Pixel && tool_ != ToolType::Select)
@@ -1630,7 +2135,7 @@ namespace canvas
             DrawButton(SidebarLayout::Tool2(), "Rectangle", tool_ == ToolType::Rectangle);
             DrawButton(SidebarLayout::Tool3(), "Circle", tool_ == ToolType::Circle);
             DrawButton(SidebarLayout::Tool4(), "Line", tool_ == ToolType::Stroke);
-            DrawButton(SidebarLayout::Tool5(), "Select Tool", tool_ == ToolType::Select);
+            DrawButton(SidebarLayout::Tool5(), TextFormat("Select Tool (%s)", selectionMode_ == SelectionMode::Lasso ? "Lasso" : "Rect"), tool_ == ToolType::Select);
 
             DrawPanelHeader(SidebarLayout::PaletteHeader(), "Palette");
             for (size_t i = 0; i < palette_.size(); ++i)
@@ -1667,6 +2172,7 @@ namespace canvas
             {
                 DrawButton(Rectangle{24, 792, 260, 28}, TextFormat("Brush thickness: %dx%d", brushThickness_, brushThickness_), false);
                 DrawButton(Rectangle{24, 826, 260, 28}, TextFormat("Anchor: %s", AnchorModeName().c_str()), false);
+                DrawButton(Rectangle{24, 860, 260, 28}, TextFormat("Select mode: %s", selectionMode_ == SelectionMode::Lasso ? "Lasso" : "Rect"), false);
             }
 
             DrawPanelHeader(SidebarLayout::OpsHeader(), "Canvas Ops");
