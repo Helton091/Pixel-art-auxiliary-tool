@@ -12,7 +12,7 @@ namespace canvas
     public:
         static std::string ExportCpp(const CanvasDocument &doc, const std::string &functionName);
         static bool SaveCpp(const std::filesystem::path &path, const CanvasDocument &doc, const std::string &functionName);
-        static bool LoadPng(const std::filesystem::path &path, CanvasDocument &doc);
+        static bool LoadImage(const std::filesystem::path &path, CanvasDocument &doc, std::string *errorMessage = nullptr);
         static bool SavePng(const std::filesystem::path &path, const CanvasDocument &doc);
     };
 }

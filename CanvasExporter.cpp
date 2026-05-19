@@ -70,11 +70,38 @@ namespace canvas
         return true;
     }
 
-    bool CanvasExporter::LoadPng(const std::filesystem::path &path, CanvasDocument &doc)
+    bool CanvasExporter::LoadImage(const std::filesystem::path &path, CanvasDocument &doc, std::string *errorMessage)
     {
-        Image image = LoadImage(path.string().c_str());
+        if (errorMessage != nullptr)
+        {
+            errorMessage->clear();
+        }
+
+        if (!std::filesystem::exists(path))
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "File does not exist";
+            }
+            return false;
+        }
+
+        if (!std::filesystem::is_regular_file(path))
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Path is not a regular file";
+            }
+            return false;
+        }
+
+        Image image = ::LoadImage(path.string().c_str());
         if (image.data == nullptr)
         {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "raylib failed to decode the image";
+            }
             return false;
         }
 

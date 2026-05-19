@@ -1,6 +1,7 @@
 #include "CanvasApp.h"
 #include "CanvasExporter.h"
 #include "CanvasTypes.h"
+#include "ImagePixelizer.h"
 #include "WindowsFileDialog.h"
 
 #include "raylib.h"
@@ -121,31 +122,69 @@ namespace canvas
         std::string pngExportPath_ = "exports/canvas.png";
         std::string debugHover_ = "";
         std::string debugPaint_ = "";
+        int pixelizeTargetWidth_{20};
+        int pixelizeTargetHeight_{20};
+        PixelizeMode pixelizeMode_{PixelizeMode::Average};
         bool editingOpenPath_{false};
         bool editingSavePath_{false};
+        bool editingPixelizeWidth_{false};
+        bool editingPixelizeHeight_{false};
         bool fullscreen_{false};
         RenderTexture2D canvasTexture_{};
         bool canvasDirty_{true};
-
-        enum class SidebarAction
-        {
-            ResizeWPlus,
-            ResizeWMinus,
-            ResizeHPlus,
-            ResizeHMinus,
-            ZoomPlus,
-            ZoomMinus,
-            OpenPng,
-            SavePng,
-            ExportCpp,
-            ClearCanvas
-        };
 
         struct CanvasView
         {
             Rectangle bounds{};
             Vector2 origin{};
             float scale{1.0f};
+        };
+
+        struct SidebarLayout
+        {
+            static constexpr float kX = 24.0f;
+            static constexpr float kW = 260.0f;
+            static constexpr float kToolH = 30.0f;
+            static constexpr float kBtnH = 28.0f;
+            static constexpr float kGap = 6.0f;
+
+            static constexpr Rectangle ToolsHeader(){ return Rectangle{kX, 118, kW, 28}; }
+            static constexpr Rectangle Tool1(){ return Rectangle{kX, 150, kW, kToolH}; }
+            static constexpr Rectangle Tool2(){ return Rectangle{kX, 186, kW, kToolH}; }
+            static constexpr Rectangle Tool3(){ return Rectangle{kX, 222, kW, kToolH}; }
+            static constexpr Rectangle Tool4(){ return Rectangle{kX, 258, kW, kToolH}; }
+            static constexpr Rectangle Tool5(){ return Rectangle{kX, 294, kW, kToolH}; }
+            static constexpr Rectangle PaletteHeader(){ return Rectangle{kX, 334, kW, 28}; }
+            static constexpr float PaletteX(size_t index){ return kX + static_cast<float>(index % 6) * 44.0f; }
+            static constexpr float PaletteY(size_t index){ return 368.0f + static_cast<float>(index / 6) * 44.0f; }
+            static constexpr Rectangle PaletteCell(size_t index){ return Rectangle{PaletteX(index), PaletteY(index), 36.0f, 36.0f}; }
+            static constexpr Rectangle InfoHeader(){ return Rectangle{kX, 476, kW, 28}; }
+            static constexpr Rectangle SettingsHeader(){ return Rectangle{kX, 724, kW, 28}; }
+            static constexpr Rectangle SettingsToggle(){ return Rectangle{kX, 758, kW, kBtnH}; }
+            static constexpr Rectangle BrushThickness(){ return Rectangle{kX, 792, kW, kBtnH}; }
+            static constexpr Rectangle AnchorMode(){ return Rectangle{kX, 826, kW, kBtnH}; }
+            static constexpr Rectangle OpsHeader(){ return Rectangle{kX, 888, kW, 28}; }
+            static constexpr Rectangle FitZoom(){ return Rectangle{kX, 922, kW, kBtnH}; }
+            static constexpr Rectangle WidthValue(){ return Rectangle{kX, 958, 120, 30}; }
+            static constexpr Rectangle HeightValue(){ return Rectangle{164, 958, 120, 30}; }
+            static constexpr Rectangle WidthMinus(){ return Rectangle{kX, 994, 120, 30}; }
+            static constexpr Rectangle WidthPlus(){ return Rectangle{164, 994, 120, 30}; }
+            static constexpr Rectangle HeightMinus(){ return Rectangle{kX, 1030, 120, 30}; }
+            static constexpr Rectangle HeightPlus(){ return Rectangle{164, 1030, 120, 30}; }
+            static constexpr Rectangle OpenPng(){ return Rectangle{kX, 1066, 120, 28}; }
+            static constexpr Rectangle PixelMode(){ return Rectangle{164, 1066, 120, 28}; }
+            static constexpr Rectangle Pixelize(){ return Rectangle{kX, 1102, kW, 28}; }
+            static constexpr Rectangle AutoCrop(){ return Rectangle{kX, 1138, 120, 28}; }
+            static constexpr Rectangle SavePng(){ return Rectangle{164, 1138, 120, 28}; }
+            static constexpr Rectangle CropSel(){ return Rectangle{kX, 1174, 120, 28}; }
+            static constexpr Rectangle EraseSel(){ return Rectangle{164, 1174, 120, 28}; }
+            static constexpr Rectangle KeepOnly(){ return Rectangle{kX, 1210, 120, 28}; }
+            static constexpr Rectangle FlipH(){ return Rectangle{164, 1210, 120, 28}; }
+            static constexpr Rectangle FlipV(){ return Rectangle{kX, 1246, 120, 28}; }
+            static constexpr Rectangle ClearSel(){ return Rectangle{164, 1246, 120, 28}; }
+            static constexpr Rectangle Shift(){ return Rectangle{kX, 1282, 120, 28}; }
+            static constexpr Rectangle ExportCpp(){ return Rectangle{164, 1282, 120, 28}; }
+            static constexpr Rectangle Clear(){ return Rectangle{kX, 1318, kW, 28}; }
         };
 
         CanvasView GetCanvasView() const
@@ -601,28 +640,127 @@ namespace canvas
             SetStatus(cppOk ? "Exported C++" : "Export failed");
         }
 
-        void ImportPng()
+        bool IsSupportedImportImage(const fs::path &path) const
+        {
+            const std::string ext = path.extension().string();
+            return ext == ".png" || ext == ".jpg" || ext == ".jpeg";
+        }
+
+        void ImportImage()
         {
             if (pngPathInput_.empty())
             {
-                SetStatus("PNG path empty");
+                SetStatus("Image path empty");
                 return;
             }
 
             const fs::path path = fs::path(pngPathInput_);
-            if (CanvasExporter::LoadPng(path, document_))
+            if (!IsSupportedImportImage(path))
             {
+                SetStatus("Only PNG/JPG/JPEG images are supported");
+                return;
+            }
+
+            std::string errorMessage;
+            if (CanvasExporter::LoadImage(path, document_, &errorMessage))
+            {
+                undoStack_.clear();
+                undoCapturedThisAction_ = false;
                 const float fitW = static_cast<float>(std::max(1, GetScreenWidth() - 344)) / std::max(1, document_.settings.width * document_.settings.cellSize);
                 const float fitH = static_cast<float>(std::max(1, GetScreenHeight() - 48)) / std::max(1, document_.settings.height * document_.settings.cellSize);
                 canvasZoom_ = std::clamp(std::min(fitW, fitH), kMinCanvasZoom, kMaxCanvasZoom);
                 canvasPan_ = {0.0f, 0.0f};
                 EnsureCanvasTexture();
-                SetStatus("PNG loaded and fit to view");
+                MarkCanvasDirty();
+                SetStatus(TextFormat("Image loaded: %s", path.filename().string().c_str()));
             }
             else
             {
-                SetStatus(TextFormat("PNG load failed: %s", path.string().c_str()));
+                if (errorMessage.empty())
+                {
+                    errorMessage = "unknown error";
+                }
+                SetStatus(TextFormat("Image load failed (%s): %s", errorMessage.c_str(), path.string().c_str()));
             }
+        }
+
+        const char *PixelizeModeName(PixelizeMode mode) const
+        {
+            switch (mode)
+            {
+            case PixelizeMode::Average:
+                return "Average";
+            case PixelizeMode::CenterSample:
+                return "Center";
+            case PixelizeMode::DominantColor:
+                return "Dominant";
+            case PixelizeMode::EdgeAware:
+                return "EdgeAware";
+            }
+            return "Average";
+        }
+
+        void CyclePixelizeMode()
+        {
+            switch (pixelizeMode_)
+            {
+            case PixelizeMode::Average:
+                pixelizeMode_ = PixelizeMode::CenterSample;
+                break;
+            case PixelizeMode::CenterSample:
+                pixelizeMode_ = PixelizeMode::DominantColor;
+                break;
+            case PixelizeMode::DominantColor:
+                pixelizeMode_ = PixelizeMode::EdgeAware;
+                break;
+            case PixelizeMode::EdgeAware:
+                pixelizeMode_ = PixelizeMode::Average;
+                break;
+            }
+            SetStatus(TextFormat("Pixelize mode: %s", PixelizeModeName(pixelizeMode_)));
+        }
+
+        void PixelizeImportedImage()
+        {
+            if (pngPathInput_.empty())
+            {
+                SetStatus("Image path empty");
+                return;
+            }
+
+            const fs::path path = fs::path(pngPathInput_);
+            if (!IsSupportedImportImage(path))
+            {
+                SetStatus("Only PNG/JPG/JPEG images are supported");
+                return;
+            }
+
+            BeginUndoIfNeeded();
+            CanvasDocument pixelized;
+            const int targetWidth = std::clamp(pixelizeTargetWidth_, 4, 256);
+            const int targetHeight = std::clamp(pixelizeTargetHeight_, 4, 256);
+            if (ImagePixelizer::PixelizeImage(path, pixelized, targetWidth, targetHeight, pixelizeMode_, true))
+            {
+                document_ = std::move(pixelized);
+                selection_ = {};
+                hasSelection_ = false;
+                movingSelection_ = false;
+                pointerMode_ = PointerMode::Idle;
+                undoStack_.clear();
+                undoCapturedThisAction_ = false;
+                const float fitW = static_cast<float>(std::max(1, GetScreenWidth() - 344)) / std::max(1, document_.settings.width * document_.settings.cellSize);
+                const float fitH = static_cast<float>(std::max(1, GetScreenHeight() - 48)) / std::max(1, document_.settings.height * document_.settings.cellSize);
+                canvasZoom_ = std::clamp(std::min(fitW, fitH), kMinCanvasZoom, kMaxCanvasZoom);
+                canvasPan_ = {0.0f, 0.0f};
+                EnsureCanvasTexture();
+                MarkCanvasDirty();
+                SetStatus(TextFormat("Pixelized image to %dx%d (%s)", targetWidth, targetHeight, PixelizeModeName(pixelizeMode_)));
+            }
+            else
+            {
+                SetStatus(TextFormat("Pixelize failed: %s", path.string().c_str()));
+            }
+            EndUndoAction();
         }
 
         SelectionRect AutoTrimTransparentBounds() const
@@ -843,10 +981,20 @@ namespace canvas
 
         void HandleSidebarClick(Vector2 mouse)
         {
-            const Rectangle toolRects[] = {{24, 150, 260, 30}, {24, 186, 260, 30}, {24, 222, 260, 30}, {24, 258, 260, 30}, {24, 294, 260, 30}};
+            const auto hit = [mouse](Rectangle rect) {
+                return CheckCollisionPointRec(mouse, rect);
+            };
+
+            const Rectangle toolRects[] = {
+                SidebarLayout::Tool1(),
+                SidebarLayout::Tool2(),
+                SidebarLayout::Tool3(),
+                SidebarLayout::Tool4(),
+                SidebarLayout::Tool5(),
+            };
             for (int i = 0; i < 5; ++i)
             {
-                if (CheckCollisionPointRec(mouse, toolRects[i]))
+                if (hit(toolRects[i]))
                 {
                     tool_ = static_cast<ToolType>(i);
                     SetStatus("Tool changed");
@@ -854,9 +1002,7 @@ namespace canvas
                 }
             }
 
-            const auto hit = [mouse](Rectangle rect) { return CheckCollisionPointRec(mouse, rect); };
-
-            if (hit(Rectangle{24, 724, 260, 28}))
+            if (hit(SidebarLayout::SettingsHeader()))
             {
                 settingsOpen_ = !settingsOpen_;
                 SetStatus(settingsOpen_ ? "Settings opened" : "Settings closed");
@@ -866,58 +1012,85 @@ namespace canvas
             {
                 return;
             }
-            if (hit(Rectangle{24, 792, 260, 28}))
+
+            if (hit(SidebarLayout::SettingsToggle()))
             {
                 brushThickness_ = brushThickness_ == 1 ? 2 : brushThickness_ == 2 ? 3 : 1;
-                SetStatus(TextFormat("Brush thickness set to %dx%d", brushThickness_, brushThickness_));
+                SetStatus(TextFormat("Brush thickness set to %d", brushThickness_));
                 return;
             }
-            if (hit(Rectangle{24, 826, 260, 28}))
+            if (hit(SidebarLayout::BrushThickness()))
             {
                 CycleAnchorMode();
                 return;
             }
-            if (hit(Rectangle{24, 958, 120, 30}))
-            {
-                ResizeCanvas(document_.settings.width + 8, document_.settings.height, mouse);
-                return;
-            }
-            if (hit(Rectangle{164, 958, 120, 30}))
-            {
-                ResizeCanvas(document_.settings.width - 8, document_.settings.height, mouse);
-                return;
-            }
-            if (hit(Rectangle{24, 994, 120, 30}))
-            {
-                ResizeCanvas(document_.settings.width, document_.settings.height + 8, mouse);
-                return;
-            }
-            if (hit(Rectangle{164, 994, 120, 30}))
-            {
-                ResizeCanvas(document_.settings.width, document_.settings.height - 8, mouse);
-                return;
-            }
-            if (hit(Rectangle{24, 1030, 120, 30}))
+
+            if (hit(SidebarLayout::FitZoom()))
             {
                 ZoomAtMouse(1.1f, mouse);
                 return;
             }
-            if (hit(Rectangle{164, 1030, 120, 30}))
+
+            if (hit(SidebarLayout::WidthValue()))
             {
-                ZoomAtMouse(1.0f / 1.1f, mouse);
+                editingPixelizeWidth_ = !editingPixelizeWidth_;
+                editingPixelizeHeight_ = false;
+                SetStatus(editingPixelizeWidth_ ? "Editing width" : "Width edit closed");
                 return;
             }
-            if (hit(Rectangle{24, 1066, 120, 28}))
+            if (hit(SidebarLayout::HeightValue()))
+            {
+                editingPixelizeHeight_ = !editingPixelizeHeight_;
+                editingPixelizeWidth_ = false;
+                SetStatus(editingPixelizeHeight_ ? "Editing height" : "Height edit closed");
+                return;
+            }
+            if (hit(SidebarLayout::WidthMinus()))
+            {
+                ResizeCanvas(document_.settings.width - 8, document_.settings.height, mouse);
+                return;
+            }
+            if (hit(SidebarLayout::WidthPlus()))
+            {
+                ResizeCanvas(document_.settings.width + 8, document_.settings.height, mouse);
+                return;
+            }
+            if (hit(SidebarLayout::HeightMinus()))
+            {
+                ResizeCanvas(document_.settings.width, document_.settings.height - 8, mouse);
+                return;
+            }
+            if (hit(SidebarLayout::HeightPlus()))
+            {
+                ResizeCanvas(document_.settings.width, document_.settings.height + 8, mouse);
+                return;
+            }
+            if (hit(SidebarLayout::OpenPng()))
             {
                 const std::string path = WindowsFileDialog::OpenPngFile();
                 if (!path.empty())
                 {
                     pngPathInput_ = path;
-                    ImportPng();
+                    ImportImage();
                 }
                 return;
             }
-            if (hit(Rectangle{164, 1066, 120, 28}))
+            if (hit(SidebarLayout::PixelMode()))
+            {
+                CyclePixelizeMode();
+                return;
+            }
+            if (hit(SidebarLayout::Pixelize()))
+            {
+                PixelizeImportedImage();
+                return;
+            }
+            if (hit(SidebarLayout::AutoCrop()))
+            {
+                AutoCropTransparentBounds();
+                return;
+            }
+            if (hit(SidebarLayout::SavePng()))
             {
                 const std::string path = WindowsFileDialog::SavePngFile();
                 if (!path.empty())
@@ -927,18 +1100,14 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{24, 1102, 120, 28}))
-            {
-                AutoCropTransparentBounds();
-                return;
-            }
-            if (hit(Rectangle{164, 1102, 120, 28}))
+            if (hit(SidebarLayout::CropSel()))
             {
                 if (selection_.IsValid())
                 {
                     document_.CropToSelection(selection_);
                     selection_ = {};
                     hasSelection_ = false;
+                    movingSelection_ = false;
                     EnsureCanvasTexture();
                     MarkCanvasDirty();
                     SetStatus("Cropped to selection");
@@ -949,7 +1118,7 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{24, 1138, 120, 28}))
+            if (hit(SidebarLayout::EraseSel()))
             {
                 if (selection_.IsValid())
                 {
@@ -963,7 +1132,7 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{164, 1138, 120, 28}))
+            if (hit(SidebarLayout::KeepOnly()))
             {
                 if (selection_.IsValid())
                 {
@@ -977,7 +1146,7 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{24, 1174, 120, 28}))
+            if (hit(SidebarLayout::FlipH()))
             {
                 if (selection_.IsValid())
                 {
@@ -993,7 +1162,7 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{164, 1174, 120, 28}))
+            if (hit(SidebarLayout::FlipV()))
             {
                 if (selection_.IsValid())
                 {
@@ -1009,7 +1178,7 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{24, 1210, 120, 28}))
+            if (hit(SidebarLayout::ClearSel()))
             {
                 selection_ = {};
                 hasSelection_ = false;
@@ -1017,7 +1186,7 @@ namespace canvas
                 SetStatus("Selection cleared");
                 return;
             }
-            if (hit(Rectangle{164, 1210, 120, 28}))
+            if (hit(SidebarLayout::Shift()))
             {
                 if (selection_.IsValid())
                 {
@@ -1032,12 +1201,12 @@ namespace canvas
                 }
                 return;
             }
-            if (hit(Rectangle{24, 1246, 260, 28}))
+            if (hit(SidebarLayout::ExportCpp()))
             {
                 HandleExport();
                 return;
             }
-            if (hit(Rectangle{24, 1284, 260, 28}))
+            if (hit(SidebarLayout::Clear()))
             {
                 document_.Clear();
                 selection_ = {};
@@ -1048,12 +1217,11 @@ namespace canvas
                 SetStatus("Canvas cleared");
                 return;
             }
+
             for (size_t i = 0; i < palette_.size(); ++i)
             {
-                const int row = static_cast<int>(i / 6);
-                const int col = static_cast<int>(i % 6);
-                const Rectangle cell{24.0f + col * 44.0f, 368.0f + row * 44.0f, 36.0f, 36.0f};
-                if (CheckCollisionPointRec(mouse, cell))
+                const Rectangle cell = SidebarLayout::PaletteCell(i);
+                if (hit(cell))
                 {
                     activeColor_ = palette_[i];
                     SetStatus(TextFormat("Color selected: %s", ColorToHex(activeColor_).c_str()));
@@ -1266,13 +1434,29 @@ namespace canvas
             {
                 brushSize_ = std::max(1, brushSize_ - 1);
             }
+            if (IsKeyPressed(KEY_F11))
+            {
+                ToggleFullscreenMode();
+            }
+            if (IsKeyPressed(KEY_M))
+            {
+                CyclePixelizeMode();
+            }
             if (IsKeyPressed(KEY_LEFT_BRACKET))
             {
-                ZoomAtMouse(1.0f / 1.1f, GetMousePosition());
+                ResizeCanvas(document_.settings.width - 8, document_.settings.height, GetMousePosition());
             }
             if (IsKeyPressed(KEY_RIGHT_BRACKET))
             {
-                ZoomAtMouse(1.1f, GetMousePosition());
+                ResizeCanvas(document_.settings.width + 8, document_.settings.height, GetMousePosition());
+            }
+            if (IsKeyPressed(KEY_MINUS))
+            {
+                ResizeCanvas(document_.settings.width, document_.settings.height - 8, GetMousePosition());
+            }
+            if (IsKeyPressed(KEY_EQUAL))
+            {
+                ResizeCanvas(document_.settings.width, document_.settings.height + 8, GetMousePosition());
             }
             const float wheel = GetMouseWheelMove();
             if (wheel != 0.0f)
@@ -1291,12 +1475,8 @@ namespace canvas
                     MarkCanvasDirty();
                 }
             }
-            if (IsKeyPressed(KEY_F11))
-            {
-                ToggleFullscreenMode();
-            }
 
-            if (editingOpenPath_ || editingSavePath_)
+            if (editingOpenPath_ || editingSavePath_ || editingPixelizeWidth_ || editingPixelizeHeight_)
             {
                 if (IsKeyPressed(KEY_BACKSPACE))
                 {
@@ -1314,12 +1494,22 @@ namespace canvas
                             pngExportPath_.pop_back();
                         }
                     }
+                    else if (editingPixelizeWidth_)
+                    {
+                        pixelizeTargetWidth_ = std::max(1, pixelizeTargetWidth_ / 10);
+                    }
+                    else if (editingPixelizeHeight_)
+                    {
+                        pixelizeTargetHeight_ = std::max(1, pixelizeTargetHeight_ / 10);
+                    }
                 }
 
                 if (IsKeyPressed(KEY_ENTER))
                 {
                     editingOpenPath_ = false;
                     editingSavePath_ = false;
+                    editingPixelizeWidth_ = false;
+                    editingPixelizeHeight_ = false;
                 }
 
                 int key = GetCharPressed();
@@ -1334,6 +1524,14 @@ namespace canvas
                         else if (editingSavePath_)
                         {
                             pngExportPath_.push_back(static_cast<char>(key));
+                        }
+                        else if (editingPixelizeWidth_ && key >= '0' && key <= '9')
+                        {
+                            pixelizeTargetWidth_ = std::clamp(pixelizeTargetWidth_ * 10 + (key - '0'), 1, 1024);
+                        }
+                        else if (editingPixelizeHeight_ && key >= '0' && key <= '9')
+                        {
+                            pixelizeTargetHeight_ = std::clamp(pixelizeTargetHeight_ * 10 + (key - '0'), 1, 1024);
                         }
                     }
                     key = GetCharPressed();
@@ -1427,19 +1625,17 @@ namespace canvas
             DrawText("LMB: draw | E: export | C: clear | +/-: brush size | [ ]: zoom | F11: fullscreen", 24, 60, 18, Color{180, 185, 200, 255});
             DrawText(TextFormat("Mode: %s", fullscreen_ ? "Fullscreen" : "Windowed"), 24, 86, 16, Color{180, 185, 200, 255});
 
-            DrawPanelHeader(Rectangle{24, 118, 260, 28}, "Tools");
-            DrawButton(Rectangle{24, 150, 260, 30}, "Pixel Brush", tool_ == ToolType::Pixel);
-            DrawButton(Rectangle{24, 186, 260, 30}, "Rectangle", tool_ == ToolType::Rectangle);
-            DrawButton(Rectangle{24, 222, 260, 30}, "Circle", tool_ == ToolType::Circle);
-            DrawButton(Rectangle{24, 258, 260, 30}, "Line", tool_ == ToolType::Stroke);
-            DrawButton(Rectangle{24, 294, 260, 30}, "Select Tool", tool_ == ToolType::Select);
+            DrawPanelHeader(SidebarLayout::ToolsHeader(), "Tools");
+            DrawButton(SidebarLayout::Tool1(), "Pixel Brush", tool_ == ToolType::Pixel);
+            DrawButton(SidebarLayout::Tool2(), "Rectangle", tool_ == ToolType::Rectangle);
+            DrawButton(SidebarLayout::Tool3(), "Circle", tool_ == ToolType::Circle);
+            DrawButton(SidebarLayout::Tool4(), "Line", tool_ == ToolType::Stroke);
+            DrawButton(SidebarLayout::Tool5(), "Select Tool", tool_ == ToolType::Select);
 
-            DrawPanelHeader(Rectangle{24, 334, 260, 28}, "Palette");
+            DrawPanelHeader(SidebarLayout::PaletteHeader(), "Palette");
             for (size_t i = 0; i < palette_.size(); ++i)
             {
-                const int row = static_cast<int>(i / 6);
-                const int col = static_cast<int>(i % 6);
-                const Rectangle cell{24.0f + col * 44.0f, 368.0f + row * 44.0f, 36.0f, 36.0f};
+                const Rectangle cell = SidebarLayout::PaletteCell(i);
                 DrawRectangleRec(cell, palette_[i]);
                 DrawRectangleLinesEx(cell, 2.0f, Color{60, 60, 70, 255});
             }
@@ -1473,26 +1669,28 @@ namespace canvas
                 DrawButton(Rectangle{24, 826, 260, 28}, TextFormat("Anchor: %s", AnchorModeName().c_str()), false);
             }
 
-            DrawPanelHeader(Rectangle{24, 888, 260, 28}, "Canvas Ops");
-            DrawButton(Rectangle{24, 922, 260, 28}, "Fit Zoom", false);
-            DrawButton(Rectangle{24, 958, 120, 30}, "+ W", false);
-            DrawButton(Rectangle{164, 958, 120, 30}, "- W", false);
-            DrawButton(Rectangle{24, 994, 120, 30}, "+ H", false);
-            DrawButton(Rectangle{164, 994, 120, 30}, "- H", false);
-            DrawButton(Rectangle{24, 1030, 120, 30}, "+ Zoom", false);
-            DrawButton(Rectangle{164, 1030, 120, 30}, "- Zoom", false);
-            DrawButton(Rectangle{24, 1066, 120, 28}, "Open PNG", false);
-            DrawButton(Rectangle{164, 1066, 120, 28}, "Save PNG", false);
-            DrawButton(Rectangle{24, 1102, 120, 28}, "Auto Crop", false);
-            DrawButton(Rectangle{164, 1102, 120, 28}, "Crop Sel", false);
-            DrawButton(Rectangle{24, 1138, 120, 28}, "Erase Sel", false);
-            DrawButton(Rectangle{164, 1138, 120, 28}, "Keep Only", false);
-            DrawButton(Rectangle{24, 1174, 120, 28}, "Flip H", false);
-            DrawButton(Rectangle{164, 1174, 120, 28}, "Flip V", false);
-            DrawButton(Rectangle{24, 1210, 120, 28}, "Clear Sel", false);
-            DrawButton(Rectangle{164, 1210, 120, 28}, "Shift", false);
-            DrawButton(Rectangle{24, 1246, 260, 28}, "Export C++", false);
-            DrawButton(Rectangle{24, 1284, 260, 28}, "Clear", false);
+            DrawPanelHeader(SidebarLayout::OpsHeader(), "Canvas Ops");
+            DrawButton(SidebarLayout::FitZoom(), "Fit Zoom", false);
+            DrawButton(SidebarLayout::WidthValue(), TextFormat("W: %d", pixelizeTargetWidth_), editingPixelizeWidth_);
+            DrawButton(SidebarLayout::HeightValue(), TextFormat("H: %d", pixelizeTargetHeight_), editingPixelizeHeight_);
+            DrawButton(SidebarLayout::WidthMinus(), "- W", false);
+            DrawButton(SidebarLayout::WidthPlus(), "+ W", false);
+            DrawButton(SidebarLayout::HeightMinus(), "- H", false);
+            DrawButton(SidebarLayout::HeightPlus(), "+ H", false);
+            DrawButton(SidebarLayout::OpenPng(), "Open PNG", false);
+            DrawButton(SidebarLayout::PixelMode(), TextFormat("Mode: %s", PixelizeModeName(pixelizeMode_)), false);
+            DrawButton(SidebarLayout::Pixelize(), "Pixelize", false);
+            DrawButton(SidebarLayout::AutoCrop(), "Auto Crop", false);
+            DrawButton(SidebarLayout::SavePng(), "Save PNG", false);
+            DrawButton(SidebarLayout::CropSel(), "Crop Sel", false);
+            DrawButton(SidebarLayout::EraseSel(), "Erase Sel", false);
+            DrawButton(SidebarLayout::KeepOnly(), "Keep Only", false);
+            DrawButton(SidebarLayout::FlipH(), "Flip H", false);
+            DrawButton(SidebarLayout::FlipV(), "Flip V", false);
+            DrawButton(SidebarLayout::ClearSel(), "Clear Sel", false);
+            DrawButton(SidebarLayout::Shift(), "Shift", false);
+            DrawButton(SidebarLayout::ExportCpp(), "Export C++", false);
+            DrawButton(SidebarLayout::Clear(), "Clear", false);
 
             const char *selText = hasSelection_ ? TextFormat("Selection: %d,%d,%d,%d", selection_.x, selection_.y, selection_.width, selection_.height) : "Selection: OFF";
 
